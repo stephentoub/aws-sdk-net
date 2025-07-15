@@ -97,6 +97,64 @@ internal sealed partial class BedrockChatClient : IChatClient
                     result.Contents.Add(new TextContent(text) { RawRepresentation = content });
                 }
 
+                if (content.CitationsContent is { } citationsContent)
+                {
+                    for (int i = 0; i < citationsContent.Content.Count; i++)
+                    {
+                        TextContent annotatedContent = new(citationsContent.Content[i].Text) { RawRepresentation = content };
+
+                        if (i < citationsContent.Citations.Count)
+                        {
+                            var citation = citationsContent.Citations[i];
+
+                            string? location = null;
+                            if (citation.Location is { } citLoc)
+                            {
+                                string term = "";
+                                int? index = null, start = null, end = null;
+                                if (citLoc.DocumentPage is { } docPage)
+                                {
+                                    term = "Page";
+                                    index = docPage.DocumentIndex;
+                                    start = docPage.Start;
+                                    end = docPage.End;
+                                }
+
+                                if (citLoc.DocumentChar is { } docChar && docChar.Start is not null && docChar.End is not null)
+                                {
+                                    term = "Character";
+                                    index = docChar.DocumentIndex;
+                                    start = docChar.Start;
+                                    end = docChar.End;
+                                }
+
+                                if (citLoc.DocumentChunk is { } docChunk && docChunk.Start is not null && docChunk.End is not null)
+                                {
+                                    term = "Chunk";
+                                    index = docChunk.DocumentIndex;
+                                    start = docChunk.Start;
+                                    end = docChunk.End;
+                                }
+
+                                if (index is not null && start is not null && end is not null)
+                                {
+                                    location = $"{term} {index}:{start}-{end}";
+                                }
+                            }
+
+                            (annotatedContent.Annotations ??= []).Add(new()
+                            {
+                                RawRepresentation = citation,
+                                Title = citation.Title,
+                                Location = location,
+                                Snippet = citation.SourceContent is { Count: > 0 } sourceContent ? string.Join("\n", sourceContent.Select(c => c.Text)) : null,
+                            });
+                        }
+
+                        result.Contents.Add(annotatedContent);
+                    }
+                }
+
                 if (content.ReasoningContent is { ReasoningText.Text: not null } reasoningContent)
                 {
                     TextReasoningContent trc = new(reasoningContent.ReasoningText.Text) { RawRepresentation = content };
