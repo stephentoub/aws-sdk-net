@@ -75,6 +75,10 @@ internal sealed partial class BedrockChatClient : IChatClient
     /// (typically <see cref="Amazon.BedrockRuntime.AmazonBedrockRuntimeException"/> with ErrorCode "ValidationException").
     /// If the model fails to return the expected structured output, <see cref="InvalidOperationException"/>
     /// is thrown.
+    /// <para/>
+    /// When <see cref="ChatOptions.Reasoning"/> is specified with a non-<see cref="ReasoningEffort.None"/> effort,
+    /// the model must support extended thinking (e.g. Anthropic Claude). Models without this support will return
+    /// an error from the Bedrock API.
     /// </remarks>
     public async Task<ChatResponse> GetResponseAsync(
         IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
@@ -90,6 +94,7 @@ internal sealed partial class BedrockChatClient : IChatClient
         request.System = CreateSystem(request.System, messages, options);
         request.ToolConfig = CreateToolConfig(request.ToolConfig, options);
         request.InferenceConfig = CreateInferenceConfiguration(request.InferenceConfig, options);
+        request.AdditionalModelRequestFields = ApplyReasoningConfig(request.AdditionalModelRequestFields, request.InferenceConfig, options);
 
         ConverseResponse response = await _runtime.ConverseAsync(request, cancellationToken).ConfigureAwait(false);
 
@@ -229,6 +234,11 @@ internal sealed partial class BedrockChatClient : IChatClient
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// When <see cref="ChatOptions.Reasoning"/> is specified with a non-<see cref="ReasoningEffort.None"/> effort,
+    /// the model must support extended thinking (e.g. Anthropic Claude). Models without this support will return
+    /// an error from the Bedrock API.
+    /// </remarks>
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
         IEnumerable<ChatMessage> messages, ChatOptions? options = null, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -257,6 +267,7 @@ internal sealed partial class BedrockChatClient : IChatClient
         request.System = CreateSystem(request.System, messages, options);
         request.ToolConfig = CreateToolConfig(request.ToolConfig, options);
         request.InferenceConfig = CreateInferenceConfiguration(request.InferenceConfig, options);
+        request.AdditionalModelRequestFields = ApplyReasoningConfig(request.AdditionalModelRequestFields, request.InferenceConfig, options);
 
         var result = await _runtime.ConverseStreamAsync(request, cancellationToken).ConfigureAwait(false);
 
@@ -1119,5 +1130,83 @@ internal sealed partial class BedrockChatClient : IChatClient
         }
 
         return config;
+    }
+
+    /// <summary>Applies reasoning configuration from ChatOptions to the AdditionalModelRequestFields.</summary>
+    /// <remarks>
+    /// Maps <see cref="ChatOptions.Reasoning"/> to Bedrock's extended thinking configuration
+    /// via the <c>thinking</c> key in <c>AdditionalModelRequestFields</c>.
+    /// Budget tokens are computed as a ratio of <c>MaxTokens</c> when available, following the
+    /// approach used by the AWS bedrock-access-gateway. The constraint <c>budget_tokens &lt; max_tokens</c>
+    /// is always enforced.
+    /// See https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html
+    /// </remarks>
+    private static Document ApplyReasoningConfig(Document additionalModelRequestFields, InferenceConfiguration inferenceConfig, ChatOptions? options)
+    {
+        if (options?.Reasoning is not { Effort: { } effort and not ReasoningEffort.None })
+        {
+            return additionalModelRequestFields;
+        }
+
+        // Don't override if the user already configured thinking via AdditionalModelRequestFields.
+        if (additionalModelRequestFields.IsDictionary() &&
+            additionalModelRequestFields.AsDictionary().ContainsKey("thinking"))
+        {
+            return additionalModelRequestFields;
+        }
+
+        // budget_tokens must be >= 1024 and < max_tokens.
+        // When max_tokens is known, compute budget_tokens as a ratio (similar to
+        // https://github.com/aws-samples/bedrock-access-gateway). When it isn't,
+        // pick fixed budget values and set max_tokens to satisfy the constraint,
+        // since the model-specific default for max_tokens is unspecified.
+        int budgetTokens;
+        if (inferenceConfig.MaxTokens is int maxTokens)
+        {
+            double ratio = effort switch
+            {
+                ReasoningEffort.Low => 0.25,
+                ReasoningEffort.Medium => 0.5,
+                ReasoningEffort.High => 0.75,
+                _ => 1.0, // ExtraHigh
+            };
+
+            budgetTokens = Math.Max(1024, (int)(maxTokens * ratio));
+            if (budgetTokens >= maxTokens)
+            {
+                budgetTokens = maxTokens - 1;
+            }
+        }
+        else
+        {
+            budgetTokens = effort switch
+            {
+                ReasoningEffort.Low => 1024,
+                ReasoningEffort.Medium => 4096,
+                ReasoningEffort.High => 16384,
+                _ => 32768, // ExtraHigh
+            };
+            inferenceConfig.MaxTokens = budgetTokens * 4;
+        }
+
+        var thinkingConfig = new Document(new Dictionary<string, Document>
+        {
+            ["type"] = new Document("enabled"),
+            ["budget_tokens"] = new Document(budgetTokens),
+        });
+
+        if (additionalModelRequestFields.IsDictionary())
+        {
+            additionalModelRequestFields.AsDictionary()["thinking"] = thinkingConfig;
+        }
+        else
+        {
+            additionalModelRequestFields = new Document(new Dictionary<string, Document>
+            {
+                ["thinking"] = thinkingConfig,
+            });
+        }
+
+        return additionalModelRequestFields;
     }
 }

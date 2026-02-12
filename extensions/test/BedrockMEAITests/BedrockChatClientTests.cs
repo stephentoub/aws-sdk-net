@@ -3630,6 +3630,199 @@ public class BedrockChatClientTests
         Assert.NotNull(stopUpdate);
     }
 
+    [Theory]
+    [Trait("UnitTest", "BedrockRuntime")]
+    [InlineData(ReasoningEffort.Low, 1024, 4096)]
+    [InlineData(ReasoningEffort.Medium, 4096, 16384)]
+    [InlineData(ReasoningEffort.High, 16384, 65536)]
+    [InlineData(ReasoningEffort.ExtraHigh, 32768, 131072)]
+    public async Task IChatClient_GetResponseAsync_ReasoningEffort_SetsThinkingConfig_NoMaxTokens(ReasoningEffort effort, int expectedBudget, int expectedMaxTokens)
+    {
+        MockBedrockRuntime mock = new()
+        {
+            OnConverseRequest = request =>
+            {
+                Assert.True(request.AdditionalModelRequestFields.IsDictionary());
+                var fields = request.AdditionalModelRequestFields.AsDictionary();
+                Assert.True(fields.ContainsKey("thinking"));
+                var thinking = fields["thinking"].AsDictionary();
+                Assert.Equal("enabled", thinking["type"].AsString());
+                Assert.Equal(expectedBudget, thinking["budget_tokens"].AsInt());
+                Assert.Equal(expectedMaxTokens, request.InferenceConfig.MaxTokens);
+
+                return CreateResponse("Thinking response.");
+            }
+        };
+
+        IChatClient chatClient = mock.AsIChatClient("claude");
+        ChatMessage[] messages = [new(ChatRole.User, "Think about this")];
+        ChatOptions options = new()
+        {
+            Reasoning = new() { Effort = effort }
+        };
+
+        ChatResponse result = await chatClient.GetResponseAsync(messages, options);
+        Assert.NotNull(result);
+    }
+
+    [Theory]
+    [Trait("UnitTest", "BedrockRuntime")]
+    [InlineData(ReasoningEffort.Low, 10000, 2500)]
+    [InlineData(ReasoningEffort.Medium, 10000, 5000)]
+    [InlineData(ReasoningEffort.High, 10000, 7500)]
+    [InlineData(ReasoningEffort.ExtraHigh, 10000, 9999)]
+    [InlineData(ReasoningEffort.Low, 2000, 1024)]       // clamped to minimum of 1024
+    [InlineData(ReasoningEffort.ExtraHigh, 1025, 1024)]  // clamped to maxTokens - 1
+    public async Task IChatClient_GetResponseAsync_ReasoningEffort_SetsThinkingConfig_WithMaxTokens(ReasoningEffort effort, int maxTokens, int expectedBudget)
+    {
+        MockBedrockRuntime mock = new()
+        {
+            OnConverseRequest = request =>
+            {
+                var thinking = request.AdditionalModelRequestFields.AsDictionary()["thinking"].AsDictionary();
+                Assert.Equal("enabled", thinking["type"].AsString());
+                Assert.Equal(expectedBudget, thinking["budget_tokens"].AsInt());
+
+                return CreateResponse("Thinking response.");
+            }
+        };
+
+        IChatClient chatClient = mock.AsIChatClient("claude");
+        ChatMessage[] messages = [new(ChatRole.User, "Think about this")];
+        ChatOptions options = new()
+        {
+            MaxOutputTokens = maxTokens,
+            Reasoning = new() { Effort = effort }
+        };
+
+        ChatResponse result = await chatClient.GetResponseAsync(messages, options);
+        Assert.NotNull(result);
+    }
+
+    [Fact]
+    [Trait("UnitTest", "BedrockRuntime")]
+    public async Task IChatClient_GetResponseAsync_ReasoningEffortNone_DoesNotSetThinkingConfig()
+    {
+        MockBedrockRuntime mock = new()
+        {
+            OnConverseRequest = request =>
+            {
+                Assert.True(request.AdditionalModelRequestFields.IsNull());
+                return CreateResponse("No thinking.");
+            }
+        };
+
+        IChatClient chatClient = mock.AsIChatClient("claude");
+        ChatMessage[] messages = [new(ChatRole.User, "Hello")];
+        ChatOptions options = new()
+        {
+            Reasoning = new() { Effort = ReasoningEffort.None }
+        };
+
+        ChatResponse result = await chatClient.GetResponseAsync(messages, options);
+        Assert.NotNull(result);
+    }
+
+    [Fact]
+    [Trait("UnitTest", "BedrockRuntime")]
+    public async Task IChatClient_GetResponseAsync_NoReasoning_DoesNotSetThinkingConfig()
+    {
+        MockBedrockRuntime mock = new()
+        {
+            OnConverseRequest = request =>
+            {
+                Assert.True(request.AdditionalModelRequestFields.IsNull());
+                return CreateResponse("No thinking.");
+            }
+        };
+
+        IChatClient chatClient = mock.AsIChatClient("claude");
+        ChatMessage[] messages = [new(ChatRole.User, "Hello")];
+        ChatOptions options = new();
+
+        ChatResponse result = await chatClient.GetResponseAsync(messages, options);
+        Assert.NotNull(result);
+    }
+
+    [Fact]
+    [Trait("UnitTest", "BedrockRuntime")]
+    public async Task IChatClient_GetResponseAsync_ReasoningDoesNotOverrideExistingThinkingConfig()
+    {
+        MockBedrockRuntime mock = new()
+        {
+            OnConverseRequest = request =>
+            {
+                var fields = request.AdditionalModelRequestFields.AsDictionary();
+                var thinking = fields["thinking"].AsDictionary();
+                Assert.Equal("enabled", thinking["type"].AsString());
+                Assert.Equal(99999, thinking["budget_tokens"].AsInt());
+
+                return CreateResponse("Custom thinking.");
+            }
+        };
+
+        IChatClient chatClient = mock.AsIChatClient("claude");
+        ChatMessage[] messages = [new(ChatRole.User, "Think")];
+        ChatOptions options = new()
+        {
+            Reasoning = new() { Effort = ReasoningEffort.Low },
+            RawRepresentationFactory = _ =>
+            {
+                var req = new ConverseRequest();
+                req.AdditionalModelRequestFields = new Document(new Dictionary<string, Document>
+                {
+                    ["thinking"] = new Document(new Dictionary<string, Document>
+                    {
+                        ["type"] = new Document("enabled"),
+                        ["budget_tokens"] = new Document(99999)
+                    })
+                });
+                return req;
+            }
+        };
+
+        ChatResponse result = await chatClient.GetResponseAsync(messages, options);
+        Assert.NotNull(result);
+    }
+
+    [Fact]
+    [Trait("UnitTest", "BedrockRuntime")]
+    public async Task IChatClient_GetResponseAsync_ReasoningMergesWithExistingAdditionalFields()
+    {
+        MockBedrockRuntime mock = new()
+        {
+            OnConverseRequest = request =>
+            {
+                var fields = request.AdditionalModelRequestFields.AsDictionary();
+                Assert.Equal("bar", fields["foo"].AsString());
+                Assert.True(fields.ContainsKey("thinking"));
+                var thinking = fields["thinking"].AsDictionary();
+                Assert.Equal("enabled", thinking["type"].AsString());
+
+                return CreateResponse("Merged fields.");
+            }
+        };
+
+        IChatClient chatClient = mock.AsIChatClient("claude");
+        ChatMessage[] messages = [new(ChatRole.User, "Think")];
+        ChatOptions options = new()
+        {
+            Reasoning = new() { Effort = ReasoningEffort.High },
+            RawRepresentationFactory = _ =>
+            {
+                var req = new ConverseRequest();
+                req.AdditionalModelRequestFields = new Document(new Dictionary<string, Document>
+                {
+                    ["foo"] = new Document("bar")
+                });
+                return req;
+            }
+        };
+
+        ChatResponse result = await chatClient.GetResponseAsync(messages, options);
+        Assert.NotNull(result);
+    }
+
     private static byte[] CreateContentBlockDeltaEventWithCitation(int contentBlockIndex, string text, string title, string snippet)
     {
         return CreateEventMessage("ContentBlockDelta", Encoding.UTF8.GetBytes($"{{\"contentBlockIndex\":{contentBlockIndex},\"delta\":{{\"text\":\"{text}\",\"citation\":{{\"title\":\"{title}\",\"sourceContent\":[{{\"text\":\"{snippet}\"}}]}}}}}}"));
